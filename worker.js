@@ -56,7 +56,6 @@ const DATA_FIELDS = [
   'class',
   'gender',
   'stream',
-  'subject',
   'extraDetail',
 ];
 
@@ -822,6 +821,38 @@ function readRosterRows(buffer) {
 // Row validation + merge logic (kept unchanged)
 // ==================================================================
 
+function splitList(v) {
+  return String(v || '')
+    .split(/[,;]+/)
+    .map((s) => s.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+function mergeList(a, b) {
+  const out = Array.isArray(a) ? [...a] : [];
+  for (const item of b || []) {
+    if (!out.some((x) => String(x).toLowerCase() === String(item).toLowerCase())) {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function buildDesired(recordType, v) {
+  if (recordType === 'teacher') {
+    return {
+      recordType,
+      firstName: v.firstName,
+      lastName: v.lastName,
+      gender: v.gender,
+      extraDetail: v.extraDetail,
+      subjects: v.subjects,
+      classes: [v.class],
+    };
+  }
+  return { recordType, ...v };
+}
+
 function validateAndNormalize(row, fileClass, fileStream) {
   const errors = [];
 
@@ -829,7 +860,7 @@ function validateAndNormalize(row, fileClass, fileStream) {
   const lastName = row.lastName;
   const className = row.class || fileClass || '';
   const stream = row.stream || fileStream || '';
-  const subject = row.subject;
+  const subjects = splitList(row.subject);
   const extraDetail = row.extraDetail;
 
   let gender = row.gender || '';
@@ -837,7 +868,7 @@ function validateAndNormalize(row, fileClass, fileStream) {
   if (!firstName) errors.push('first name is required');
   if (!lastName) errors.push('last name is required');
   if (!className) errors.push('class is required');
-  if (!subject) errors.push('subject is required');
+  if (subjects.length === 0) errors.push('subject is required');
 
   if (gender) {
     const g = gender.toLowerCase();
@@ -856,13 +887,16 @@ function validateAndNormalize(row, fileClass, fileStream) {
       class: className,
       gender,
       stream,
-      subject,
+      subjects,
       extraDetail: extraDetail || '',
     },
   };
 }
 
 function localKey(recordType, value) {
+  if (recordType === 'teacher') {
+    return ['teacher', value.firstName, value.lastName].join('\u0000');
+  }
   return [recordType, value.firstName, value.lastName, value.class, value.stream].join('\u0000');
 }
 
@@ -881,17 +915,16 @@ async function queryCandidates(env, token, schoolId, recordType, desired) {
     fieldFilter('recordType', 'EQUAL', { stringValue: recordType }),
     fieldFilter('firstName', 'EQUAL', { stringValue: desired.firstName }),
     fieldFilter('lastName', 'EQUAL', { stringValue: desired.lastName }),
-    fieldFilter('class', 'EQUAL', { stringValue: desired.class }),
   ];
 
-  if (desired.stream) {
-    filters.push(fieldFilter('stream', 'EQUAL', { stringValue: desired.stream }));
+  if (recordType === 'student') {
+    filters.push(fieldFilter('class', 'EQUAL', { stringValue: desired.class }));
+    if (desired.stream) {
+      filters.push(fieldFilter('stream', 'EQUAL', { stringValue: desired.stream }));
+    }
   }
 
-  const where =
-    filters.length === 1
-      ? filters[0]
-      : { compositeFilter: { op: 'AND', filters } };
+  const where = { compositeFilter: { op: 'AND', filters } };
 
   const structuredQuery = {
     from: [{ collectionId: 'roster' }],
@@ -931,6 +964,12 @@ function computeDiff(existingData, desired) {
     const next = String(desired[field] ?? '');
     if (current !== next) diff[field] = desired[field];
   }
+  for (const f of ['subjects', 'classes']) {
+    if (!desired[f]) continue;
+    const merged = mergeList(existingData[f], desired[f]);
+    const before = Array.isArray(existingData[f]) ? existingData[f].length : 0;
+    if (merged.length !== before) diff[f] = merged;
+  }
   return diff;
 }
 
@@ -956,7 +995,6 @@ async function processRosterRows({
   const remaining = Math.max(0, rows.length - nextOffset);
 
   const queue = new WriteQueue(env, token);
-  const localIndex = new Map();
 
   let created = 0;
   let updated = 0;
@@ -964,6 +1002,8 @@ async function processRosterRows({
   const rejected = [];
   const now = new Date();
 
+  // Group rows so one student/teacher = one record, with all subjects gathered.
+  const groups = new Map();
   for (const row of slice) {
     const { errors, value } = validateAndNormalize(row, fileClass, fileStream);
 
@@ -972,15 +1012,22 @@ async function processRosterRows({
       continue;
     }
 
-    const desired = { recordType, ...value };
+    const desired = buildDesired(recordType, value);
     const key = localKey(recordType, desired);
+    const g = groups.get(key);
 
-    let existing = localIndex.get(key);
-    if (existing === undefined) {
-      const docs = await queryCandidates(env, token, schoolId, recordType, desired);
-      existing = pickBestCandidate(docs, desired);
-      localIndex.set(key, existing);
+    if (!g) {
+      groups.set(key, desired);
+    } else {
+      g.subjects = mergeList(g.subjects, desired.subjects);
+      if (recordType === 'teacher') g.classes = mergeList(g.classes, desired.classes);
+      if (!g.gender && desired.gender) g.gender = desired.gender;
     }
+  }
+
+  for (const desired of groups.values()) {
+    const docs = await queryCandidates(env, token, schoolId, recordType, desired);
+    const existing = pickBestCandidate(docs, desired);
 
     if (existing) {
       const diff = computeDiff(existing.data, desired);
@@ -995,8 +1042,6 @@ async function processRosterRows({
         batchId,
         updatedAt: now,
       });
-
-      existing.data = { ...existing.data, ...diff };
       updated += 1;
     } else {
       const docId = generateDocId();
@@ -1010,8 +1055,6 @@ async function processRosterRows({
       };
 
       await queue.create(['schools', schoolId, 'roster', docId], data);
-
-      localIndex.set(key, { id: docId, data: desired });
       created += 1;
     }
   }
