@@ -57,6 +57,7 @@ const DATA_FIELDS = [
   'gender',
   'stream',
   'extraDetail',
+  'studentId',
 ];
 
 // ==================================================================
@@ -176,15 +177,6 @@ function strOrEmpty(v) {
 // Service account loading / caching
 // ==================================================================
 
-/**
- * Read the service-account secret.
- *
- * Matches the convention used by edutraceug-auth-worker and
- * edutraceug-email-worker: the secret is named ACCOUNT-SERVICE-FIREBASE
- * (hyphenated — allowed for Cloudflare/Wrangler secrets, unlike Node env
- * vars). We also fall back to the underscore form so anything still
- * setting the older name keeps working during the transition.
- */
 function getServiceAccount(env) {
   const raw =
     env['ACCOUNT-SERVICE-FIREBASE'] ||
@@ -509,7 +501,6 @@ class WriteQueue {
     this.writes = [];
   }
 
-  // Partial update — only the fields in `data` are touched.
   update(segments, data) {
     const fieldPaths = Object.keys(data);
     this.writes.push({
@@ -522,7 +513,6 @@ class WriteQueue {
     return this.#maybeFlush();
   }
 
-  // Strict create — fails if the document already exists.
   create(segments, data) {
     this.writes.push({
       update: {
@@ -534,7 +524,6 @@ class WriteQueue {
     return this.#maybeFlush();
   }
 
-  // Merge-set — creates if missing, overwrites only the fields in `data`.
   merge(segments, data) {
     const fieldPaths = Object.keys(data);
     this.writes.push({
@@ -670,10 +659,11 @@ async function uploadRawToCloudinary(env, file, { folder }) {
 }
 
 // ==================================================================
-// SheetJS parser — header detection & row extraction (kept unchanged)
+// SheetJS parser — header detection & row extraction
 // ==================================================================
 
 const CANONICAL_FIELDS = [
+  'studentId',
   'firstName',
   'lastName',
   'class',
@@ -686,6 +676,7 @@ const CANONICAL_FIELDS = [
 const POSITIONAL_ORDER = [...CANONICAL_FIELDS];
 
 const ALIASES = {
+  studentId: ['studentid', 'id', 'regno', 'regnumber', 'registration', 'lin', 'no'],
   firstName: ['firstname', 'givenname', 'forename', 'first', 'fname', 'christianname'],
   lastName: ['lastname', 'surname', 'familyname', 'secondname', 'last', 'lname'],
   class: ['class', 'classname', 'grade', 'form', 'level', 'year'],
@@ -798,6 +789,7 @@ function readRosterRows(buffer) {
 
     rows.push({
       excelRow: i + 1,
+      studentId: cellAt(raw, columns.map.studentId),
       firstName: cellAt(raw, columns.map.firstName),
       lastName: cellAt(raw, columns.map.lastName),
       class: cellAt(raw, columns.map.class),
@@ -810,7 +802,7 @@ function readRosterRows(buffer) {
 
   if (rows.length === 0) {
     throw new UploadValidationError(
-      'No data rows found. The file must contain a header row (first name, last name, class, subject, ...) followed by data rows.'
+      'No data rows found. The file must contain a header row (first name, last name, class, ...) followed by data rows.'
     );
   }
 
@@ -818,7 +810,7 @@ function readRosterRows(buffer) {
 }
 
 // ==================================================================
-// Row validation + merge logic (kept unchanged)
+// Row validation + merge logic
 // ==================================================================
 
 function splitList(v) {
@@ -850,10 +842,20 @@ function buildDesired(recordType, v) {
       classes: [v.class],
     };
   }
-  return { recordType, ...v };
+  // Student: no subjects, no classes array. Just the flat student fields.
+  return {
+    recordType,
+    firstName: v.firstName,
+    lastName: v.lastName,
+    class: v.class,
+    gender: v.gender,
+    stream: v.stream,
+    extraDetail: v.extraDetail,
+    studentId: v.studentId || '',
+  };
 }
 
-function validateAndNormalize(row, fileClass, fileStream) {
+function validateAndNormalize(row, fileClass, fileStream, recordType) {
   const errors = [];
 
   const firstName = row.firstName;
@@ -862,13 +864,18 @@ function validateAndNormalize(row, fileClass, fileStream) {
   const stream = row.stream || fileStream || '';
   const subjects = splitList(row.subject);
   const extraDetail = row.extraDetail;
+  const studentId = row.studentId || '';
 
   let gender = row.gender || '';
 
   if (!firstName) errors.push('first name is required');
   if (!lastName) errors.push('last name is required');
   if (!className) errors.push('class is required');
-  if (subjects.length === 0) errors.push('subject is required');
+
+  // Subject is only required for teachers.
+  if (recordType === 'teacher' && subjects.length === 0) {
+    errors.push('subject is required');
+  }
 
   if (gender) {
     const g = gender.toLowerCase();
@@ -889,6 +896,7 @@ function validateAndNormalize(row, fileClass, fileStream) {
       stream,
       subjects,
       extraDetail: extraDetail || '',
+      studentId,
     },
   };
 }
@@ -964,11 +972,15 @@ function computeDiff(existingData, desired) {
     const next = String(desired[field] ?? '');
     if (current !== next) diff[field] = desired[field];
   }
-  for (const f of ['subjects', 'classes']) {
-    if (!desired[f]) continue;
-    const merged = mergeList(existingData[f], desired[f]);
-    const before = Array.isArray(existingData[f]) ? existingData[f].length : 0;
-    if (merged.length !== before) diff[f] = merged;
+
+  // Only teachers have subjects / classes arrays to merge.
+  if (desired.recordType === 'teacher') {
+    for (const f of ['subjects', 'classes']) {
+      if (!desired[f]) continue;
+      const merged = mergeList(existingData[f], desired[f]);
+      const before = Array.isArray(existingData[f]) ? existingData[f].length : 0;
+      if (merged.length !== before) diff[f] = merged;
+    }
   }
   return diff;
 }
@@ -1005,7 +1017,7 @@ async function processRosterRows({
   // Group rows so one student/teacher = one record, with all subjects gathered.
   const groups = new Map();
   for (const row of slice) {
-    const { errors, value } = validateAndNormalize(row, fileClass, fileStream);
+    const { errors, value } = validateAndNormalize(row, fileClass, fileStream, recordType);
 
     if (errors.length > 0) {
       rejected.push({ row: row.excelRow, reason: errors.join('; ') });
@@ -1019,9 +1031,12 @@ async function processRosterRows({
     if (!g) {
       groups.set(key, desired);
     } else {
-      g.subjects = mergeList(g.subjects, desired.subjects);
-      if (recordType === 'teacher') g.classes = mergeList(g.classes, desired.classes);
+      if (recordType === 'teacher') {
+        g.subjects = mergeList(g.subjects, desired.subjects);
+        g.classes = mergeList(g.classes, desired.classes);
+      }
       if (!g.gender && desired.gender) g.gender = desired.gender;
+      if (!g.studentId && desired.studentId) g.studentId = desired.studentId;
     }
   }
 
@@ -1073,7 +1088,7 @@ async function processRosterRows({
 }
 
 // ==================================================================
-// File-extension/MIME gate (replaces multer's fileFilter)
+// File-extension/MIME gate
 // ==================================================================
 
 function validateFileMetadata(file) {
