@@ -161,7 +161,6 @@ function safeBaseName(name) {
 }
 
 function generateDocId() {
-  // Firestore-style 20-char alphanumeric id
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const bytes = crypto.getRandomValues(new Uint8Array(20));
   let out = '';
@@ -842,11 +841,6 @@ function buildDesired(recordType, v) {
       classes: [v.class],
     };
   }
-  // Student: no subjects, no classes array. Just the flat student fields.
-
-
-// Student: keep subjects if the sheet provided them.
-  // Student: keep subjects if the sheet provided them.
   return {
     recordType,
     firstName: v.firstName,
@@ -877,7 +871,6 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
   if (!lastName) errors.push('last name is required');
   if (!className) errors.push('class is required');
 
-  // Subject is only required for teachers.
   if (recordType === 'teacher' && subjects.length === 0) {
     errors.push('subject is required');
   }
@@ -986,14 +979,17 @@ function computeDiff(existingData, desired) {
     if (cs !== ns) diff[field] = next;
   }
 
-  // Only teachers have subjects / classes arrays to merge.
-  if (desired.recordType === 'teacher') {
-    for (const f of ['subjects', 'classes']) {
-      if (!desired[f]) continue;
-      const merged = mergeList(existingData[f], desired[f]);
-      const before = Array.isArray(existingData[f]) ? existingData[f].length : 0;
-      if (merged.length !== before) diff[f] = merged;
-    }
+  // FIXED: Merges subjects for both students and teachers when updating records in Firestore
+  if (desired.subjects && desired.subjects.length > 0) {
+    const merged = mergeList(existingData.subjects, desired.subjects);
+    const before = Array.isArray(existingData.subjects) ? existingData.subjects.length : 0;
+    if (merged.length !== before) diff.subjects = merged;
+  }
+
+  if (desired.recordType === 'teacher' && desired.classes) {
+    const merged = mergeList(existingData.classes, desired.classes);
+    const before = Array.isArray(existingData.classes) ? existingData.classes.length : 0;
+    if (merged.length !== before) diff.classes = merged;
   }
   return diff;
 }
@@ -1027,7 +1023,6 @@ async function processRosterRows({
   const rejected = [];
   const now = new Date();
 
-  // Group rows so one student/teacher = one record, with all subjects gathered.
   const groups = new Map();
   for (const row of slice) {
     const { errors, value } = validateAndNormalize(row, fileClass, fileStream, recordType);
@@ -1044,8 +1039,10 @@ async function processRosterRows({
     if (!g) {
       groups.set(key, desired);
     } else {
+      // FIXED: Merges subjects for both students and teachers during row aggregation
+      g.subjects = mergeList(g.subjects, desired.subjects);
+
       if (recordType === 'teacher') {
-        g.subjects = mergeList(g.subjects, desired.subjects);
         g.classes = mergeList(g.classes, desired.classes);
       }
       if (!g.gender && desired.gender) g.gender = desired.gender;
@@ -1311,7 +1308,7 @@ async function handleUploadRoster(request, env) {
     uid: user.uid,
   });
 
-  /* ---- 8. Batch record (create on first call, roll counters otherwise) ---- */
+  /* ---- 8. Batch record ---- */
   const now = new Date();
   const batchPath = ['schools', schoolId, 'rosterUploads', batchId];
 
@@ -1418,5 +1415,3 @@ export default {
     );
   },
 };
-
-
