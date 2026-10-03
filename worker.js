@@ -58,8 +58,8 @@ const DATA_FIELDS = [
   'stream',
   'extraDetail',
   'studentId',
+  'subjects',
 ];
-
 // ==================================================================
 // Module-level caches (persist for the lifetime of a Worker isolate)
 // ==================================================================
@@ -843,6 +843,10 @@ function buildDesired(recordType, v) {
     };
   }
   // Student: no subjects, no classes array. Just the flat student fields.
+
+
+// Student: keep subjects if the sheet provided them.
+  // Student: keep subjects if the sheet provided them.
   return {
     recordType,
     firstName: v.firstName,
@@ -852,6 +856,7 @@ function buildDesired(recordType, v) {
     stream: v.stream,
     extraDetail: v.extraDetail,
     studentId: v.studentId || '',
+    subjects: Array.isArray(v.subjects) ? v.subjects : [],
   };
 }
 
@@ -968,9 +973,17 @@ function pickBestCandidate(docs, desired) {
 function computeDiff(existingData, desired) {
   const diff = {};
   for (const field of DATA_FIELDS) {
-    const current = String(existingData[field] ?? '');
-    const next = String(desired[field] ?? '');
-    if (current !== next) diff[field] = desired[field];
+    const cur = existingData[field];
+    const next = desired[field];
+    if (Array.isArray(cur) || Array.isArray(next)) {
+      const a = JSON.stringify(Array.isArray(cur) ? cur : []);
+      const b = JSON.stringify(Array.isArray(next) ? next : []);
+      if (a !== b) diff[field] = Array.isArray(next) ? next : [];
+      continue;
+    }
+    const cs = String(cur ?? '');
+    const ns = String(next ?? '');
+    if (cs !== ns) diff[field] = next;
   }
 
   // Only teachers have subjects / classes arrays to merge.
@@ -1405,3 +1418,5 @@ export default {
     );
   },
 };
+
+
