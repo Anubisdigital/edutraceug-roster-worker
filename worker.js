@@ -1386,6 +1386,211 @@ async function handleUploadRoster(request, env) {
 }
 
 // ==================================================================
+// ADD to edutraceug-roster-worker
+// Endpoints: POST /roster/list, /roster/update, /roster/add, /roster/delete
+// ==================================================================
+
+async function requireUser(request, env, allowedRoles) {
+  const m = (request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) throw new HttpError(401, 'Missing Authorization header.');
+  const projectId = getServiceAccount(env).project_id;
+  let claims;
+  try {
+    claims = await verifyFirebaseIdToken(m[1].trim(), projectId);
+  } catch (err) {
+    throw new HttpError(401, `Invalid or expired ID token. (${err.message})`);
+  }
+  const user = { uid: claims.sub, role: claims.role || null, schoolId: claims.schoolId || null };
+  if (!allowedRoles.includes(user.role)) {
+    throw new HttpError(403, `Requires role: ${allowedRoles.join(' or ')}.`);
+  }
+  return user;
+}
+
+async function readRosterBody(request, user) {
+  const body = await request.json().catch(() => ({}));
+  const schoolId = strOrEmpty(body.schoolId);
+  if (!schoolId || user.schoolId !== schoolId) {
+    throw new HttpError(403, "Your token's schoolId does not match the requested schoolId.");
+  }
+  return { body, schoolId };
+}
+
+// Teachers are blocked for now. When teacher.html and the teacher/class
+// assignment data are available, return true here for classes the teacher teaches.
+function canWriteClass(user, _className) {
+  return user.role === 'schoolAdmin';
+}
+
+function cleanStudentFields(input) {
+  const s = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  const errors = [];
+  const out = {
+    studentId: s(input.studentId),
+    firstName: s(input.firstName),
+    lastName: s(input.lastName),
+    class: s(input.class),
+    stream: s(input.stream),
+    extraDetail: s(input.extraDetail),
+    subjects: Array.isArray(input.subjects) ? input.subjects.map(s).filter(Boolean) : splitList(input.subjects),
+  };
+  let gender = s(input.gender);
+  const g = gender.toLowerCase();
+  if (g === 'male' || g === 'm') gender = 'Male';
+  else if (g === 'female' || g === 'f') gender = 'Female';
+  else if (gender) errors.push('gender must be Male or Female');
+  out.gender = gender;
+
+  if (!out.firstName) errors.push('first name is required');
+  if (!out.lastName) errors.push('last name is required');
+  if (!out.class) errors.push('class is required');
+  return { errors, value: out };
+}
+
+const nk = (v) => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+async function handleRosterList(request, env) {
+  const user = await requireUser(request, env, ['schoolAdmin', 'teacher']);
+  const { schoolId } = await readRosterBody(request, user);
+  const token = await getAccessToken(env);
+
+  const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
+    from: [{ collectionId: 'roster' }],
+    where: fieldFilter('recordType', 'EQUAL', { stringValue: 'student' }),
+  });
+
+  const rows = docs.map((doc) => {
+    const d = fromFirestoreDocument(doc);
+    return {
+      id: doc.name.split('/').pop(),
+      studentId: d.studentId || '',
+      firstName: d.firstName || '',
+      lastName: d.lastName || '',
+      class: d.class || '',
+      stream: d.stream || '',
+      gender: d.gender || '',
+      subjects: Array.isArray(d.subjects) ? d.subjects : [],
+      extraDetail: d.extraDetail || '',
+    };
+  });
+  return jsonResponse({ status: 'ok', rows });
+}
+
+async function handleRosterUpdate(request, env) {
+  const user = await requireUser(request, env, ['schoolAdmin']);
+  const { body, schoolId } = await readRosterBody(request, user);
+  const id = strOrEmpty(body.id);
+  if (!id) throw new HttpError(400, '"id" is required.');
+
+  const { errors, value } = cleanStudentFields(body.fields || {});
+  if (errors.length) throw new HttpError(400, errors.join('; '));
+  if (!canWriteClass(user, value.class)) throw new HttpError(403, 'You cannot edit this class.');
+
+  const token = await getAccessToken(env);
+  const path = ['schools', schoolId, 'roster', id];
+  const snap = await getFirestoreDocument(env, token, path);
+  if (!snap) throw new HttpError(404, 'Student record not found.');
+  if (fromFirestoreDocument(snap).recordType !== 'student') {
+    throw new HttpError(400, 'Only student records can be edited here.');
+  }
+
+  const data = { ...value, updatedAt: new Date(), updatedBy: user.uid };
+  await firestoreCommit(env, token, [{
+    update: { name: docName(env, path), fields: toFirestoreFields(data) },
+    updateMask: { fieldPaths: Object.keys(data) },
+    currentDocument: { exists: true },
+  }]);
+  return jsonResponse({ status: 'ok' });
+}
+
+async function handleRosterAdd(request, env) {
+  const user = await requireUser(request, env, ['schoolAdmin', 'teacher']);
+  const { body, schoolId } = await readRosterBody(request, user);
+  const input = Array.isArray(body.rows) ? body.rows : [];
+  if (input.length === 0) throw new HttpError(400, '"rows" is required.');
+  if (input.length > 100) throw new HttpError(400, 'Add at most 100 students at a time.');
+
+  const cleaned = [];
+  for (let i = 0; i < input.length; i += 1) {
+    const { errors, value } = cleanStudentFields(input[i] || {});
+    if (errors.length) throw new HttpError(400, `Row ${i + 1}: ${errors.join('; ')}`);
+    if (!canWriteClass(user, value.class)) throw new HttpError(403, `You cannot add students to ${value.class}.`);
+    cleaned.push(value);
+  }
+
+  const token = await getAccessToken(env);
+
+  // One query per distinct class to catch duplicates (same name, class, stream)
+  const classes = [...new Set(cleaned.map((v) => v.class))];
+  const seen = new Set();
+  for (const cls of classes) {
+    const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
+      from: [{ collectionId: 'roster' }],
+      where: {
+        compositeFilter: {
+          op: 'AND',
+          filters: [
+            fieldFilter('recordType', 'EQUAL', { stringValue: 'student' }),
+            fieldFilter('class', 'EQUAL', { stringValue: cls }),
+          ],
+        },
+      },
+    });
+    for (const doc of docs) {
+      const d = fromFirestoreDocument(doc);
+      seen.add([nk(d.firstName), nk(d.lastName), nk(d.class), nk(d.stream)].join('|'));
+    }
+  }
+
+  const now = new Date();
+  const writes = [];
+  const duplicates = [];
+  for (const v of cleaned) {
+    const key = [nk(v.firstName), nk(v.lastName), nk(v.class), nk(v.stream)].join('|');
+    if (seen.has(key)) { duplicates.push(`${v.firstName} ${v.lastName}`); continue; }
+    seen.add(key);
+    const data = {
+      recordType: 'student',
+      ...v,
+      createdBy: user.uid,
+      createdByRole: user.role,
+      createdAt: now,
+      updatedAt: now,
+    };
+    writes.push({
+      update: { name: docName(env, ['schools', schoolId, 'roster', generateDocId()]), fields: toFirestoreFields(data) },
+      currentDocument: { exists: false },
+    });
+  }
+  if (writes.length) await firestoreCommit(env, token, writes);
+  return jsonResponse({ status: 'ok', created: writes.length, duplicates });
+}
+
+async function handleRosterDelete(request, env) {
+  const user = await requireUser(request, env, ['schoolAdmin']);
+  const { body, schoolId } = await readRosterBody(request, user);
+  const id = strOrEmpty(body.id);
+  if (!id) throw new HttpError(400, '"id" is required.');
+
+  const token = await getAccessToken(env);
+  const path = ['schools', schoolId, 'roster', id];
+  const snap = await getFirestoreDocument(env, token, path);
+  if (!snap) throw new HttpError(404, 'Student record not found.');
+  if (fromFirestoreDocument(snap).recordType !== 'student') {
+    throw new HttpError(400, 'Only student records can be removed here.');
+  }
+  await firestoreCommit(env, token, [{ delete: docName(env, path) }]);
+  return jsonResponse({ status: 'ok' });
+}
+
+const ROSTER_ROUTES = {
+  '/roster/list': handleRosterList,
+  '/roster/update': handleRosterUpdate,
+  '/roster/add': handleRosterAdd,
+  '/roster/delete': handleRosterDelete,
+};
+
+// ==================================================================
 // Worker entry point
 // ==================================================================
 
@@ -1404,6 +1609,14 @@ export default {
     if (url.pathname === '/upload-roster' && request.method === 'POST') {
       try {
         return await handleUploadRoster(request, env);
+      } catch (err) {
+        return errorResponse(err);
+      }
+    }
+
+    if (request.method === 'POST' && ROSTER_ROUTES[url.pathname]) {
+      try {
+        return await ROSTER_ROUTES[url.pathname](request, env);
       } catch (err) {
         return errorResponse(err);
       }
