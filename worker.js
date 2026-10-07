@@ -7,6 +7,9 @@
  * parses it with SheetJS, and merges structured rows into Firestore at
  * schools/{schoolId}/roster.
  *
+ * Also serves the roster viewer/editor endpoints:
+ *   POST /roster/list | /roster/update | /roster/add | /roster/delete
+ *
  * All Firebase / Cloudinary / HTTP-server concerns are implemented against
  * REST APIs using `crypto.subtle` and `fetch`, not Node SDKs.
  * ================================================================== */
@@ -17,7 +20,9 @@ import * as XLSX from 'xlsx';
 // Constants
 // ==================================================================
 
-const MAX_ROWS_PER_CALL = 1000;
+// Each call loads the school's roster ONCE and matches rows in memory, so a call
+// costs ~8 outgoing requests regardless of size (free-plan limit is 50).
+const MAX_ROWS_PER_CALL = 300;
 const DEFAULT_MAX_FILE_SIZE_MB = 25;
 const ACCEPTED_EXTENSIONS = ['.xlsx', '.xls', '.xlsm', '.xltx', '.xltm', '.csv'];
 
@@ -899,13 +904,6 @@ function validateAndNormalize(row, fileClass, fileStream, recordType) {
   };
 }
 
-function localKey(recordType, value) {
-  if (recordType === 'teacher') {
-    return ['teacher', value.firstName, value.lastName].join('\u0000');
-  }
-  return [recordType, value.firstName, value.lastName, value.class, value.stream].join('\u0000');
-}
-
 function fieldFilter(fieldPath, op, value) {
   return {
     fieldFilter: {
@@ -916,29 +914,51 @@ function fieldFilter(fieldPath, op, value) {
   };
 }
 
-async function queryCandidates(env, token, schoolId, recordType, desired) {
-  const filters = [
-    fieldFilter('recordType', 'EQUAL', { stringValue: recordType }),
-    fieldFilter('firstName', 'EQUAL', { stringValue: desired.firstName }),
-    fieldFilter('lastName', 'EQUAL', { stringValue: desired.lastName }),
-  ];
+// ---- In-memory roster index (replaces one Firestore query per student) ----
 
-  if (recordType === 'student') {
-    filters.push(fieldFilter('class', 'EQUAL', { stringValue: desired.class }));
-    if (desired.stream) {
-      filters.push(fieldFilter('stream', 'EQUAL', { stringValue: desired.stream }));
-    }
-  }
+function normKey(v) {
+  return String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
 
-  const where = { compositeFilter: { op: 'AND', filters } };
+function rosterKey(recordType, d) {
+  return recordType === 'teacher'
+    ? ['t', normKey(d.firstName), normKey(d.lastName)].join('|')
+    : ['s', normKey(d.firstName), normKey(d.lastName), normKey(d.class), normKey(d.stream)].join('|');
+}
 
-  const structuredQuery = {
+// Student key without stream: used when an uploaded row has no stream.
+function looseStudentKey(d) {
+  return ['s', normKey(d.firstName), normKey(d.lastName), normKey(d.class)].join('|');
+}
+
+async function loadRosterIndex(env, token, schoolId, recordType) {
+  const docs = await firestoreRunQuery(env, token, ['schools', schoolId], {
     from: [{ collectionId: 'roster' }],
-    where,
-    limit: 10,
+    where: fieldFilter('recordType', 'EQUAL', { stringValue: recordType }),
+  });
+
+  const exact = new Map();
+  const loose = new Map();
+  const push = (map, k, doc) => {
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(doc);
   };
 
-  return firestoreRunQuery(env, token, ['schools', schoolId], structuredQuery);
+  for (const doc of docs) {
+    const d = fromFirestoreDocument(doc);
+    push(exact, rosterKey(recordType, d), doc);
+    if (recordType === 'student') push(loose, looseStudentKey(d), doc);
+  }
+  return { exact, loose };
+}
+
+function findCandidates(index, recordType, desired) {
+  const hit = index.exact.get(rosterKey(recordType, desired));
+  if (hit && hit.length) return hit;
+  if (recordType === 'student' && !desired.stream) {
+    return index.loose.get(looseStudentKey(desired)) || [];
+  }
+  return [];
 }
 
 function pickBestCandidate(docs, desired) {
@@ -1016,6 +1036,7 @@ async function processRosterRows({
   const remaining = Math.max(0, rows.length - nextOffset);
 
   const queue = new WriteQueue(env, token);
+  const index = await loadRosterIndex(env, token, schoolId, recordType);
 
   let created = 0;
   let updated = 0;
@@ -1033,7 +1054,7 @@ async function processRosterRows({
     }
 
     const desired = buildDesired(recordType, value);
-    const key = localKey(recordType, desired);
+    const key = rosterKey(recordType, desired);
     const g = groups.get(key);
 
     if (!g) {
@@ -1051,7 +1072,7 @@ async function processRosterRows({
   }
 
   for (const desired of groups.values()) {
-    const docs = await queryCandidates(env, token, schoolId, recordType, desired);
+    const docs = findCandidates(index, recordType, desired);
     const existing = pickBestCandidate(docs, desired);
 
     if (existing) {
@@ -1386,8 +1407,7 @@ async function handleUploadRoster(request, env) {
 }
 
 // ==================================================================
-// ADD to edutraceug-roster-worker
-// Endpoints: POST /roster/list, /roster/update, /roster/add, /roster/delete
+// Roster viewer/editor endpoints
 // ==================================================================
 
 async function requireUser(request, env, allowedRoles) {
@@ -1416,8 +1436,8 @@ async function readRosterBody(request, user) {
   return { body, schoolId };
 }
 
-// Teachers are blocked for now. When teacher.html and the teacher/class
-// assignment data are available, return true here for classes the teacher teaches.
+// Teachers are blocked for now. When the teacher/class assignment data is
+// available, return true here for classes the teacher teaches.
 function canWriteClass(user, _className) {
   return user.role === 'schoolAdmin';
 }
@@ -1446,8 +1466,6 @@ function cleanStudentFields(input) {
   if (!out.class) errors.push('class is required');
   return { errors, value: out };
 }
-
-const nk = (v) => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
 async function handleRosterList(request, env) {
   const user = await requireUser(request, env, ['schoolAdmin', 'teacher']);
@@ -1538,7 +1556,7 @@ async function handleRosterAdd(request, env) {
     });
     for (const doc of docs) {
       const d = fromFirestoreDocument(doc);
-      seen.add([nk(d.firstName), nk(d.lastName), nk(d.class), nk(d.stream)].join('|'));
+      seen.add([normKey(d.firstName), normKey(d.lastName), normKey(d.class), normKey(d.stream)].join('|'));
     }
   }
 
@@ -1546,7 +1564,7 @@ async function handleRosterAdd(request, env) {
   const writes = [];
   const duplicates = [];
   for (const v of cleaned) {
-    const key = [nk(v.firstName), nk(v.lastName), nk(v.class), nk(v.stream)].join('|');
+    const key = [normKey(v.firstName), normKey(v.lastName), normKey(v.class), normKey(v.stream)].join('|');
     if (seen.has(key)) { duplicates.push(`${v.firstName} ${v.lastName}`); continue; }
     seen.add(key);
     const data = {
